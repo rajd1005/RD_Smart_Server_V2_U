@@ -9,6 +9,8 @@ const socket = io();
 let datePicker;
 let videoPlayer = null; 
 let watermarkInterval = null; 
+let progressInterval = null; 
+let symbolCategories = { 'Forex/Crypto': [], 'Stock': [], 'Index': [], 'Mcx': [] }; 
 
 const userData = {
     email: localStorage.getItem('userEmail'),
@@ -20,18 +22,108 @@ window.onload = function() {
     initDatePicker();
     fetchTrades(); 
     fetchCourses(); 
+    fetchUserNotifications(false); // Load initial page
     applyRoleRestrictions(); 
     
     switchSection('learning'); 
     
-    if (sessionStorage.getItem('disclaimerAccepted') !== 'true') {
-        const modalEl = document.getElementById('disclaimerModal');
-        if (modalEl) bootstrap.Modal.getOrCreateInstance(modalEl).show();
+    checkDisclaimer();
+    registerServiceWorker(); 
+    
+    const notifSheet = document.getElementById('notificationSheet');
+    if (notifSheet) {
+        notifSheet.addEventListener('show.bs.offcanvas', function () {
+            const badge = document.getElementById('notifBadge');
+            if (badge) badge.style.display = 'none';
+        });
+    }
+
+    const scheduledPushModalEl = document.getElementById('scheduledPushModal');
+    if (scheduledPushModalEl) {
+        scheduledPushModalEl.addEventListener('show.bs.modal', function () {
+            fetchScheduledPushes();
+        });
     }
 };
 
+// --- FALLBACK BACKGROUND POLLER TO GUARANTEE LIVE UPDATES ---
+setInterval(() => {
+    const tradeSec = document.getElementById('tradeSection');
+    if (tradeSec && tradeSec.style.display === 'block' && !isSelectionMode) {
+        fetchTrades();
+    }
+}, 5000); 
+// ---------------------------------------------------------------
+
+async function registerServiceWorker() {
+    if ('serviceWorker' in navigator && 'PushManager' in window) {
+        try {
+            const keyRes = await fetch('/api/push/public_key');
+            const keyData = await keyRes.json();
+            
+            if (!keyData.success) {
+                console.log("Push keys not ready yet.");
+                return;
+            }
+
+            const registration = await navigator.serviceWorker.register('/sw.js');
+            const subscription = await registration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: keyData.publicKey
+            });
+            
+            await fetch('/api/push/subscribe', {
+                method: 'POST',
+                body: JSON.stringify(subscription),
+                headers: { 'content-type': 'application/json' },
+                credentials: 'same-origin'
+            });
+        } catch (error) {
+            console.log('Service Worker or Push Notification registration failed:', error);
+        }
+    }
+}
+
+async function checkDisclaimer() {
+    if (sessionStorage.getItem('disclaimerAccepted') !== 'true') {
+        try {
+            const settingsRes = await fetch('/api/settings');
+            const settings = await settingsRes.json();
+            
+            if (settings.show_disclaimer !== 'false') {
+                const modalEl = document.getElementById('disclaimerModal');
+                if (modalEl) {
+                    const agreeBtn = document.getElementById('btnAgreeDisclaimer');
+                    const scrollBody = document.getElementById('disclaimerScrollBody');
+                    
+                    if (window.innerWidth <= 768 && agreeBtn && scrollBody) {
+                        agreeBtn.disabled = true;
+                        agreeBtn.innerText = "Scroll to Agree ▼";
+                        
+                        scrollBody.addEventListener('scroll', function() {
+                            if (scrollBody.scrollTop + scrollBody.clientHeight >= scrollBody.scrollHeight - 15) {
+                                agreeBtn.disabled = false;
+                                agreeBtn.innerText = "I AGREE";
+                            }
+                        });
+                        
+                        setTimeout(() => {
+                            if (scrollBody.scrollHeight <= scrollBody.clientHeight) {
+                                agreeBtn.disabled = false;
+                                agreeBtn.innerText = "I AGREE";
+                            }
+                        }, 500);
+                    }
+                    bootstrap.Modal.getOrCreateInstance(modalEl).show();
+                }
+            }
+        } catch (err) { console.error("Error loading disclaimer config"); }
+    }
+}
+
 window.acceptDisclaimer = async function() {
     const btn = document.querySelector('#disclaimerModal .btn-success');
+    if (!btn) return;
     const originalText = btn.innerText;
     btn.innerText = "⏳ Recording Agreement...";
     btn.disabled = true;
@@ -64,23 +156,34 @@ document.addEventListener('show.bs.collapse', function (e) {
 });
 
 function switchSection(section) {
+    document.getElementById('tradeSection').style.display = 'none';
+    document.getElementById('learningSection').style.display = 'none';
+    const pushSec = document.getElementById('pushSection');
+    if(pushSec) pushSec.style.display = 'none';
+    
+    document.getElementById('navTradeBtn').classList.remove('b-active');
+    document.getElementById('navLearnBtn').classList.remove('b-active');
+    const navPushBtn = document.getElementById('navPushBtn');
+    if(navPushBtn) navPushBtn.classList.remove('b-active');
+
+    document.getElementById('btnRefresh').style.display = 'none';
+    document.getElementById('btnFilter').style.display = 'none';
+    document.getElementById('btnSelect').style.display = 'none';
+    document.getElementById('btnDelete').style.display = 'none';
+
     if (section === 'trade') {
         document.getElementById('tradeSection').style.display = 'block';
-        document.getElementById('learningSection').style.display = 'none';
         document.getElementById('navTradeBtn').classList.add('b-active');
-        document.getElementById('navLearnBtn').classList.remove('b-active');
         document.getElementById('btnRefresh').style.display = 'flex';
         document.getElementById('btnFilter').style.display = 'flex';
         applyRoleRestrictions(); 
+    } else if (section === 'push') {
+        if(pushSec) pushSec.style.display = 'flex';
+        if(navPushBtn) navPushBtn.classList.add('b-active');
+        fetchChatNotifications(false); // Load initial page
     } else {
-        document.getElementById('tradeSection').style.display = 'none';
         document.getElementById('learningSection').style.display = 'block';
         document.getElementById('navLearnBtn').classList.add('b-active');
-        document.getElementById('navTradeBtn').classList.remove('b-active');
-        document.getElementById('btnRefresh').style.display = 'none';
-        document.getElementById('btnFilter').style.display = 'none';
-        document.getElementById('btnSelect').style.display = 'none';
-        document.getElementById('btnDelete').style.display = 'none';
         fetchCourses();
     }
 }
@@ -251,10 +354,7 @@ async function fetchCourses() {
         
         container.innerHTML = htmlContent || '<div class="p-4 text-center text-muted">No courses found.</div>';
         
-        // Initialize Sortable logic for admin users
         if (userData.role === 'admin' && typeof Sortable !== 'undefined') {
-            
-            // 1. Module Dragging
             const courseContainer = document.getElementById('courseModuleContainer');
             if (courseContainer) {
                 new Sortable(courseContainer, {
@@ -267,7 +367,6 @@ async function fetchCourses() {
                 });
             }
 
-            // 2. Lesson Dragging
             document.querySelectorAll('.lesson-container-sortable').forEach(container => {
                 new Sortable(container, {
                     animation: 150,
@@ -279,7 +378,6 @@ async function fetchCourses() {
                 });
             });
 
-            // 3. Homepage Layout Dragging (Added Missing Initialization)
             const layoutDraggable = document.getElementById('homepageLayoutDraggable');
             if (layoutDraggable) {
                 new Sortable(layoutDraggable, {
@@ -302,6 +400,10 @@ async function fetchCourses() {
             const adminHideCheck = document.getElementById('adminHideTradeTab');
             if (adminHideCheck) adminHideCheck.checked = hideTradeTab;
 
+            const pushTradeAlerts = settings.push_trade_alerts !== 'false';
+            const adminPushTradeCheck = document.getElementById('adminPushTradeAlerts');
+            if (adminPushTradeCheck) adminPushTradeCheck.checked = pushTradeAlerts;
+
             const showGallery = settings.show_gallery !== 'false';
             const adminGalleryCheck = document.getElementById('adminShowGallery');
             if (adminGalleryCheck) adminGalleryCheck.checked = showGallery;
@@ -310,7 +412,40 @@ async function fetchCourses() {
             const adminCallWidgetCheck = document.getElementById('adminShowCallWidget');
             if (adminCallWidgetCheck) adminCallWidgetCheck.checked = showCallWidget;
 
-            // Render existing layout arrangement for the draggable UI in Admin Panel
+            const showStickyFooter = settings.show_sticky_footer !== 'false';
+            const adminStickyCheck = document.getElementById('adminShowStickyFooter');
+            if (adminStickyCheck) adminStickyCheck.checked = showStickyFooter;
+
+            const safeSetVal = (elId, val) => { const el = document.getElementById(elId); if (el) el.value = val || ''; };
+            safeSetVal('adminBtn1Text', settings.sticky_btn1_text);
+            safeSetVal('adminBtn1Icon', settings.sticky_btn1_icon);
+            safeSetVal('adminBtn1Link', settings.sticky_btn1_link);
+            safeSetVal('adminBtn2Text', settings.sticky_btn2_text);
+            safeSetVal('adminBtn2Icon', settings.sticky_btn2_icon);
+            safeSetVal('adminBtn2Link', settings.sticky_btn2_link);
+            
+            const showDisclaimer = settings.show_disclaimer !== 'false';
+            const adminDisclaimerCheck = document.getElementById('adminShowDisclaimer');
+            if (adminDisclaimerCheck) adminDisclaimerCheck.checked = showDisclaimer;
+            safeSetVal('adminRegisterLink', settings.register_link);
+
+            const catForex = settings.cat_forex_crypto || '';
+            const catStock = settings.cat_stock || '';
+            const catIndex = settings.cat_index || '';
+            const catMcx = settings.cat_mcx || '';
+            
+            symbolCategories['Forex/Crypto'] = catForex.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s);
+            symbolCategories['Stock'] = catStock.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s);
+            symbolCategories['Index'] = catIndex.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s);
+            symbolCategories['Mcx'] = catMcx.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s);
+
+            safeSetVal('adminCatForex', catForex);
+            safeSetVal('adminCatStock', catStock);
+            safeSetVal('adminCatIndex', catIndex);
+            safeSetVal('adminCatMcx', catMcx);
+
+            if (allTrades && allTrades.length > 0) applyFilters(); 
+
             if (settings.homepage_layout && userData.role === 'admin') {
                 const layoutOrder = JSON.parse(settings.homepage_layout);
                 const layoutUl = document.getElementById('homepageLayoutDraggable');
@@ -346,7 +481,6 @@ async function openSecureVideo(lessonId) {
             const vw = videoPlayer.videoWidth();
             const vh = videoPlayer.videoHeight();
             
-            // Check if the API is supported (iOS Safari Fix)
             if (screen.orientation && screen.orientation.lock) {
                 try { 
                     if (vw > vh) { 
@@ -358,7 +492,6 @@ async function openSecureVideo(lessonId) {
                     console.log("Orientation lock failed", e);
                 }
             } else {
-                // Fallback for iOS devices
                 if (vw > vh && window.innerHeight > window.innerWidth) {
                     alert("For the best experience, please rotate your device horizontally.");
                 }
@@ -381,10 +514,24 @@ async function openSecureVideo(lessonId) {
 
         startWatermark();
         videoPlayer.play();
+
+        if (progressInterval) clearInterval(progressInterval);
+        progressInterval = setInterval(() => {
+            if (!videoPlayer.paused()) {
+                fetch('/api/video/progress', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ lessonId: lessonId, currentTime: videoPlayer.currentTime() })
+                }).catch(e => {});
+            }
+        }, 10000);
+
     } catch(err) { alert("🚨 Error loading video stream."); }
 }
 
 function closeVideoPlayer() {
+    if (progressInterval) clearInterval(progressInterval); 
     if (videoPlayer) { videoPlayer.pause(); videoPlayer.reset(); }
     if (screen.orientation && screen.orientation.unlock) { try { screen.orientation.unlock(); } catch (e) {} }
     if (document.fullscreenElement || document.webkitFullscreenElement) {
@@ -436,7 +583,6 @@ function moveWatermark() {
 }
 
 
-// --- FORM SUBMIT HANDLERS ---
 const formAdminSettings = document.getElementById('formAdminSettings');
 if (formAdminSettings) {
     formAdminSettings.addEventListener('submit', async (e) => {
@@ -445,10 +591,21 @@ if (formAdminSettings) {
         
         const state = document.getElementById('adminAccordionState')?.value || 'first';
         const hideTrade = document.getElementById('adminHideTradeTab')?.checked ? 'true' : 'false';
+        const push_trade_alerts = document.getElementById('adminPushTradeAlerts')?.checked ? 'true' : 'false';
         const showGallery = document.getElementById('adminShowGallery')?.checked ? 'true' : 'false';
         const showCallWidget = document.getElementById('adminShowCallWidget')?.checked ? 'true' : 'false';
+
+        const showStickyFooter = document.getElementById('adminShowStickyFooter')?.checked ? 'true' : 'false';
+        const sticky_btn1_text = document.getElementById('adminBtn1Text')?.value || '';
+        const sticky_btn1_icon = document.getElementById('adminBtn1Icon')?.value || '';
+        const sticky_btn1_link = document.getElementById('adminBtn1Link')?.value || '';
+        const sticky_btn2_text = document.getElementById('adminBtn2Text')?.value || '';
+        const sticky_btn2_icon = document.getElementById('adminBtn2Icon')?.value || '';
+        const sticky_btn2_link = document.getElementById('adminBtn2Link')?.value || '';
         
-        // Retrieve the new layout arrangement from the Draggable UI
+        const showDisclaimer = document.getElementById('adminShowDisclaimer')?.checked ? 'true' : 'false';
+        const register_link = document.getElementById('adminRegisterLink')?.value || '';
+        
         let homepage_layout = undefined;
         const layoutList = document.querySelectorAll('#homepageLayoutDraggable li');
         if (layoutList.length > 0) {
@@ -460,8 +617,18 @@ if (formAdminSettings) {
             const bodyData = { 
                 accordion_state: state, 
                 hide_trade_tab: hideTrade, 
+                push_trade_alerts: push_trade_alerts,
                 show_gallery: showGallery, 
-                show_call_widget: showCallWidget 
+                show_call_widget: showCallWidget,
+                show_sticky_footer: showStickyFooter,
+                sticky_btn1_text: sticky_btn1_text,
+                sticky_btn1_icon: sticky_btn1_icon,
+                sticky_btn1_link: sticky_btn1_link,
+                sticky_btn2_text: sticky_btn2_text,
+                sticky_btn2_icon: sticky_btn2_icon,
+                sticky_btn2_link: sticky_btn2_link,
+                show_disclaimer: showDisclaimer,
+                register_link: register_link
             };
             if (homepage_layout) bodyData.homepage_layout = homepage_layout;
 
@@ -481,6 +648,39 @@ if (formAdminSettings) {
             }
         } catch(err) { alert("Network error saving settings."); }
         finally { btn.innerText = "Save Settings"; btn.disabled = false; }
+    });
+}
+
+const formAdminSymbols = document.getElementById('formAdminSymbols');
+if (formAdminSymbols) {
+    formAdminSymbols.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = e.target.querySelector('button'); btn.innerText = "Saving..."; btn.disabled = true;
+        
+        try {
+            const bodyData = { 
+                cat_forex_crypto: document.getElementById('adminCatForex')?.value || '',
+                cat_stock: document.getElementById('adminCatStock')?.value || '',
+                cat_index: document.getElementById('adminCatIndex')?.value || '',
+                cat_mcx: document.getElementById('adminCatMcx')?.value || ''
+            };
+
+            const res = await fetch('/api/admin/settings/symbols', { 
+                method: 'PUT', 
+                headers: {'Content-Type': 'application/json'}, 
+                credentials: 'same-origin', 
+                body: JSON.stringify(bodyData) 
+            });
+            
+            if(res.ok) { 
+                alert("Symbol Categories saved successfully!");
+                fetchCourses(); 
+            } else { 
+                const errData = await res.json().catch(()=>({}));
+                alert("Error saving symbols: " + (errData.msg || "Unknown"));
+            }
+        } catch(err) { alert("Network error saving symbols."); }
+        finally { btn.innerText = "Save Symbols"; btn.disabled = false; }
     });
 }
 
@@ -647,12 +847,43 @@ if (formEditLesson) {
 
 async function deleteLesson(e, id) {
     e.stopPropagation(); 
-    if(!confirm("⚠️ Delete this video?")) return;
-    try { const res = await fetch(`/api/admin/lessons/${id}`, { method: 'DELETE', credentials: 'same-origin' }); if(res.ok) fetchCourses(); } catch(e) {}
+    const password = prompt("🔒 Enter Admin Password to delete this lesson:");
+    if (!password) return;
+    try { 
+        const res = await fetch(`/api/admin/lessons/${id}`, { 
+            method: 'DELETE', 
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ password })
+        }); 
+        const data = await res.json();
+        if(res.ok && data.success) fetchCourses(); 
+        else alert(data.msg || "Error deleting lesson");
+    } catch(e) {}
+}
+
+async function deleteModule(e, id) {
+    e.stopPropagation();
+    const password = prompt("🔒 Enter Admin Password to delete this module:");
+    if (!password) return;
+    try { 
+        const res = await fetch(`/api/admin/modules/${id}`, { 
+            method: 'DELETE', 
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ password })
+        }); 
+        const data = await res.json();
+        if(res.ok && data.success) fetchCourses(); 
+        else alert(data.msg || "Error deleting module");
+    } catch(e) { console.error(e); }
 }
 
 function applyRoleRestrictions() {
     const role = localStorage.getItem('userRole');
+    const statPoints = document.getElementById('statPoints');
+    const statWinRate = document.getElementById('statWinRate');
+
     if (role === 'admin') {
         document.getElementById('btnSelect').style.display = 'flex';
         document.getElementById('btnDelete').style.display = 'flex';
@@ -660,6 +891,16 @@ function applyRoleRestrictions() {
         if (btnAdminCourseManager) btnAdminCourseManager.style.display = 'inline-block';
         const adminAccordionControls = document.getElementById('adminAccordionControls');
         if (adminAccordionControls) adminAccordionControls.style.display = 'block';
+
+        if (statPoints) statPoints.style.display = 'flex';
+        if (statWinRate) statWinRate.style.display = 'flex';
+
+        const navPushBtn = document.getElementById('navPushBtn');
+        if (navPushBtn) navPushBtn.style.display = 'flex';
+
+    } else {
+        if (statPoints) statPoints.style.display = 'none';
+        if (statWinRate) statWinRate.style.display = 'none';
     }
 }
 
@@ -668,7 +909,34 @@ function initDatePicker() {
     datePicker = flatpickr("#filterDateRange", { mode: "range", dateFormat: "Y-m-d", defaultDate: today, onChange: function() { applyFilters(); } });
 }
 
-socket.on('trade_update', () => { fetchTrades(); });
+// --- SOUND ALERT ---
+const tradeSound = new Audio('/chaching.mp3');
+
+socket.on('trade_update', () => { 
+    fetchTrades(); 
+    tradeSound.play().catch(e => { console.log("Browser blocked auto-play sound."); });
+});
+
+// --- LISTEN FOR NOTIFICATIONS ---
+socket.on('new_notification', () => {
+    if (typeof fetchUserNotifications === 'function') fetchUserNotifications(false);
+    if (typeof fetchChatNotifications === 'function') fetchChatNotifications(false);
+    
+    const badge = document.getElementById('notifBadge');
+    if (badge) badge.style.display = 'block';
+    
+    tradeSound.play().catch(e => {});
+});
+
+socket.on('force_logout', (data) => {
+    const currentEmail = localStorage.getItem('userEmail');
+    const currentSessionId = localStorage.getItem('sessionId');
+    
+    if (currentEmail === data.email && currentSessionId !== data.newSessionId) {
+        alert("Logged in from another device. Your current session has expired.");
+        logout(); 
+    }
+});
 
 async function fetchTrades() {
     const checkedIds = getCheckedIds();
@@ -695,6 +963,7 @@ function applyFilters(preserveIds = []) {
     const filterSymbol = document.getElementById('filterSymbol')?.value || '';
     const filterStatus = document.getElementById('filterStatus')?.value || 'ALL';
     const filterType = document.getElementById('filterType')?.value || 'ALL';
+    const filterCategory = document.getElementById('filterCategory')?.value || 'ALL'; 
     let startDate = ""; let endDate = "";
     
     if (datePicker && datePicker.selectedDates.length > 0) {
@@ -745,7 +1014,13 @@ function applyFilters(preserveIds = []) {
         else if (filterStatus === 'SL') statusMatch = (displayStatus.includes('SL') || displayStatus.includes('LOSS'));
         else if (filterStatus === 'OPEN') statusMatch = isVisuallyActive;
 
-        if (typeMatch && symbolMatch && statusMatch) { 
+        let categoryMatch = true;
+        if (filterCategory !== 'ALL') {
+            const allowedSymbols = symbolCategories[filterCategory] || [];
+            categoryMatch = allowedSymbols.includes(trade.symbol.toUpperCase());
+        }
+
+        if (typeMatch && symbolMatch && statusMatch && categoryMatch) { 
             acc.push({ ...trade, displayStatus, isVisuallyActive, tradeDateObj }); 
         }
         return acc;
@@ -876,3 +1151,349 @@ if (filterStatusEl) filterStatusEl.addEventListener('change', () => applyFilters
 
 const filterTypeEl = document.getElementById('filterType');
 if (filterTypeEl) filterTypeEl.addEventListener('change', () => applyFilters());
+
+const filterCategoryEl = document.getElementById('filterCategory');
+if (filterCategoryEl) filterCategoryEl.addEventListener('change', () => applyFilters());
+
+
+// ========================================================
+// PAGINATED PUSH NOTIFICATION CHAT UI LOGIC
+// ========================================================
+let chatNotifications = [];
+let adminNotifOffset = 0;
+const NOTIF_LIMIT = 15; // Limit chunks roughly equivalent to a day of notifications
+
+async function fetchChatNotifications(loadMore = false) {
+    const history = document.getElementById('chatHistory');
+    if(!history) return;
+    
+    if (loadMore) {
+        adminNotifOffset += NOTIF_LIMIT;
+        const btn = document.getElementById('btnLoadMoreAdmin');
+        if(btn) btn.innerText = 'Loading...';
+    } else {
+        adminNotifOffset = 0;
+        chatNotifications = [];
+    }
+
+    try {
+        const res = await fetch(`/api/admin/notifications?limit=${NOTIF_LIMIT}&offset=${adminNotifOffset}`, { credentials: 'same-origin' });
+        const json = await res.json();
+        
+        if(json.success) {
+            const fetched = json.data;
+            
+            if (!loadMore) chatNotifications = fetched;
+            else chatNotifications = [...chatNotifications, ...fetched];
+            
+            if (chatNotifications.length === 0) {
+                history.innerHTML = '<div class="text-center text-muted mt-3" style="font-size:12px;">No broadcasts sent yet.</div>';
+                return;
+            }
+
+            // chatNotifications has newest first (DESC). We want newest at bottom, so we reverse it.
+            const sortedForDisplay = [...chatNotifications].reverse();
+            
+            let html = '';
+            // "Show More" button goes at the TOP because oldest messages are at the top
+            if (fetched.length === NOTIF_LIMIT) {
+                html += `<div class="text-center my-2"><button id="btnLoadMoreAdmin" class="btn btn-sm btn-outline-secondary shadow-sm" style="font-size: 11px; border-radius: 12px; padding: 4px 12px; background: #fff;" onclick="fetchChatNotifications(true)">Show More Old Broadcasts</button></div>`;
+            }
+
+            html += sortedForDisplay.map(n => {
+                const dateObj = n.scheduled_for ? new Date(n.scheduled_for) : new Date(n.created_at);
+                const dateStr = dateObj.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' }) + ' ' + dateObj.toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+                
+                const isScheduled = n.status === 'pending';
+                const bubbleClass = isScheduled ? 'scheduled' : 'sent';
+                const icon = isScheduled ? 'schedule' : 'done_all';
+                const iconColor = isScheduled ? '#856404' : '#53bdeb';
+                
+                let targetText = '';
+if (n.target_audience === 'logged_in') targetText = '🔒 Login Users';
+else if (n.target_audience === 'non_logged_in') targetText = '🌐 Public Users';
+else if (n.target_audience === 'both') targetText = '🌍 All Users';
+else if (n.target_audience === 'login_no_level_2') targetText = '🔒 Login (No Lvl 2)';
+else if (n.target_audience === 'login_no_level_3') targetText = '🔒 Login (No Lvl 3)';
+else if (n.target_audience === 'login_no_level_4') targetText = '🔒 Login (No Lvl 4)';
+else if (n.target_audience === 'login_with_level_2') targetText = '🔒 Login (With Lvl 2)';
+else if (n.target_audience === 'login_with_level_3') targetText = '🔒 Login (With Lvl 3)';
+else if (n.target_audience === 'login_with_level_4') targetText = '🔒 Login (With Lvl 4)';
+else targetText = '🌍 All Users';
+
+                let recurrenceText = '';
+                if (n.recurrence === 'daily') recurrenceText = ' | 🔁 Daily';
+                else if (n.recurrence === 'weekly') recurrenceText = ' | 🔁 Weekly';
+
+                return `
+                <div class="chat-bubble ${bubbleClass}">
+                    <div class="chat-title">${n.title}</div>
+                    <div class="chat-body">${n.body}</div>
+                    ${n.url && n.url !== '/' ? `<a href="${n.url}" target="_blank" class="chat-link">${n.url}</a>` : ''}
+                    <div class="chat-meta">
+                        <span class="badge bg-secondary me-auto" style="font-size:8px;">${targetText}${recurrenceText}</span>
+                        <span>${isScheduled ? 'Sched: ' : ''}${dateStr}</span>
+                        <span class="material-icons-round" style="font-size:14px; color:${iconColor};">${icon}</span>
+                        <span class="material-icons-round chat-del-btn ms-2" onclick="deleteChatPush(${n.id})">delete</span>
+                    </div>
+                </div>`;
+            }).join('');
+            
+            const oldScrollHeight = history.scrollHeight;
+            history.innerHTML = html;
+
+            // Maintain scroll position when loading history
+            if (!loadMore) history.scrollTop = history.scrollHeight;
+            else history.scrollTop = history.scrollHeight - oldScrollHeight;
+        }
+    } catch (e) {
+        if(!loadMore) history.innerHTML = '<div class="text-center text-danger mt-3" style="font-size:12px;">Error loading messages.</div>';
+    }
+}
+
+const formChatPush = document.getElementById('formChatPush');
+if (formChatPush) {
+    formChatPush.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('btnChatPushSubmit');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+
+        const formData = new FormData();
+        formData.append('target_audience', document.getElementById('chatPushTarget').value);
+        formData.append('title', document.getElementById('chatPushTitle').value);
+        formData.append('body', document.getElementById('chatPushBody').value);
+        formData.append('url', document.getElementById('chatPushUrl').value);
+        
+        const scheduleTime = document.getElementById('chatPushSchedule').value;
+        if (scheduleTime) formData.append('schedule_time', scheduleTime);
+        
+        formData.append('recurrence', document.getElementById('chatPushRecurrence').value || 'none');
+        
+        const imageEl = document.getElementById('chatPushImage');
+        if (imageEl && imageEl.files[0]) {
+            formData.append('push_image', imageEl.files[0]);
+        }
+
+        try {
+            const res = await fetch('/api/admin/notifications', {
+                method: 'POST',
+                body: formData,
+                credentials: 'same-origin'
+            });
+
+            if (res.ok) {
+                document.getElementById('chatPushTitle').value = '';
+                document.getElementById('chatPushBody').value = '';
+                document.getElementById('chatPushUrl').value = '';
+                document.getElementById('chatPushSchedule').value = '';
+                document.getElementById('chatPushRecurrence').value = 'none';
+                if (imageEl) imageEl.value = '';
+                fetchChatNotifications(false); // Reset and load newest
+            } else {
+                alert("Error sending notification.");
+            }
+        } catch (e) { alert("Network Error"); }
+        finally { 
+            btn.disabled = false; 
+            btn.innerHTML = '<span class="material-icons-round" style="margin-left:4px; font-size:18px;">send</span>';
+        }
+    });
+}
+
+window.deleteChatPush = async function(id) {
+    if(!confirm("Are you sure you want to delete this notification?")) return;
+    try {
+        const res = await fetch(`/api/admin/notifications/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+        if(res.ok) fetchChatNotifications(false);
+    } catch(e) { alert("Error deleting."); }
+};
+
+// --- SCHEDULED PUSHES MANAGEMENT ---
+async function fetchScheduledPushes() {
+    const list = document.getElementById('scheduledPushList');
+    if(!list) return;
+    list.innerHTML = '<div class="text-center text-muted p-3" style="font-size: 12px;">Loading...</div>';
+    try {
+        const res = await fetch('/api/admin/notifications/scheduled', { credentials: 'same-origin' });
+        const json = await res.json();
+        if(json.success) {
+            if(json.data.length === 0) {
+                list.innerHTML = '<div class="text-center text-muted p-3" style="font-size: 12px;">No scheduled or recurring pushes found.</div>';
+                return;
+            }
+            list.innerHTML = json.data.map(n => {
+                const dateObj = n.scheduled_for ? new Date(n.scheduled_for) : null;
+                const dateStr = dateObj ? dateObj.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' }) + ' ' + dateObj.toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }) : 'Immediate/Sent';
+                
+                let targetText = '🌍 All Users';
+if (n.target_audience === 'logged_in') targetText = '🔒 Login Users';
+else if (n.target_audience === 'non_logged_in') targetText = '🌐 Public Users';
+else if (n.target_audience === 'login_no_level_2') targetText = '🔒 Login (No Lvl 2)';
+else if (n.target_audience === 'login_no_level_3') targetText = '🔒 Login (No Lvl 3)';
+else if (n.target_audience === 'login_no_level_4') targetText = '🔒 Login (No Lvl 4)';
+else if (n.target_audience === 'login_with_level_2') targetText = '🔒 Login (With Lvl 2)';
+else if (n.target_audience === 'login_with_level_3') targetText = '🔒 Login (With Lvl 3)';
+else if (n.target_audience === 'login_with_level_4') targetText = '🔒 Login (With Lvl 4)';
+                let recurrenceText = n.recurrence === 'daily' ? ' | 🔁 Daily' : (n.recurrence === 'weekly' ? ' | 🔁 Weekly' : ' | Once');
+
+                return `
+                <div class="p-2 mb-2 bg-white rounded border shadow-sm position-relative">
+                    <div class="fw-bold text-dark" style="font-size: 13px;">${n.title}</div>
+                    <div class="text-muted" style="font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${n.body}</div>
+                    <div class="mt-1 d-flex justify-content-between align-items-center">
+                        <span class="badge bg-light text-dark border" style="font-size: 9px;">${targetText}${recurrenceText}</span>
+                        <span class="text-primary fw-bold" style="font-size: 10px;">${dateStr}</span>
+                    </div>
+                    <div class="mt-2 d-flex gap-2">
+                        <button class="btn btn-sm btn-outline-primary w-50 py-1" style="font-size:10px; font-weight:bold;" onclick='openEditPushModal(${JSON.stringify(n).replace(/'/g, "\\'")})'>Edit</button>
+                        <button class="btn btn-sm btn-outline-danger w-50 py-1" style="font-size:10px; font-weight:bold;" onclick="deleteScheduledPush(${n.id})">Delete</button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+    } catch(e) { list.innerHTML = '<div class="text-center text-danger p-3" style="font-size: 12px;">Error loading.</div>'; }
+}
+
+window.openEditPushModal = function(n) {
+    document.getElementById('editPushId').value = n.id;
+    document.getElementById('editPushTarget').value = n.target_audience || 'both';
+    document.getElementById('editPushTitle').value = n.title || '';
+    document.getElementById('editPushBody').value = n.body || '';
+    document.getElementById('editPushUrl').value = n.url !== '/' ? n.url : '';
+    document.getElementById('editPushRecurrence').value = n.recurrence || 'none';
+    
+    const imgInput = document.getElementById('editPushImage');
+    if(imgInput) imgInput.value = ''; // Reset file input
+    
+    const currentImgLabel = document.getElementById('editPushCurrentImgLabel');
+    if(currentImgLabel) {
+        currentImgLabel.style.display = n.image_path ? 'block' : 'none';
+    }
+
+    if (n.scheduled_for) {
+        // Convert ISO to datetime-local format (YYYY-MM-DDThh:mm) respecting timezone offset
+        const d = new Date(n.scheduled_for);
+        const tzOffset = d.getTimezoneOffset() * 60000;
+        const localISOTime = (new Date(d - tzOffset)).toISOString().slice(0, 16);
+        document.getElementById('editPushSchedule').value = localISOTime;
+    } else {
+        document.getElementById('editPushSchedule').value = '';
+    }
+
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('editPushModal')).show();
+};
+
+window.deleteScheduledPush = async function(id) {
+    if(!confirm("Delete this scheduled notification?")) return;
+    try {
+        const res = await fetch(`/api/admin/notifications/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+        if(res.ok) {
+            fetchScheduledPushes();
+            fetchChatNotifications(false);
+        }
+    } catch(e) { alert("Error deleting."); }
+};
+
+const formEditPush = document.getElementById('formEditPush');
+if (formEditPush) {
+    formEditPush.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('btnEditPushSubmit');
+        btn.disabled = true; btn.innerText = 'Saving...';
+
+        const id = document.getElementById('editPushId').value;
+        const formData = new FormData();
+        formData.append('target_audience', document.getElementById('editPushTarget').value);
+        formData.append('title', document.getElementById('editPushTitle').value);
+        formData.append('body', document.getElementById('editPushBody').value);
+        formData.append('url', document.getElementById('editPushUrl').value);
+        
+        const scheduleTime = document.getElementById('editPushSchedule').value;
+        if(scheduleTime) formData.append('schedule_time', scheduleTime);
+        
+        formData.append('recurrence', document.getElementById('editPushRecurrence').value || 'none');
+        
+        const imageEl = document.getElementById('editPushImage');
+        if (imageEl && imageEl.files[0]) {
+            formData.append('push_image', imageEl.files[0]);
+        }
+
+        try {
+            const res = await fetch(`/api/admin/notifications/${id}`, {
+                method: 'PUT',
+                body: formData,
+                credentials: 'same-origin'
+            });
+            if (res.ok) {
+                bootstrap.Modal.getInstance(document.getElementById('editPushModal')).hide();
+                fetchScheduledPushes();
+                fetchChatNotifications(false);
+            } else {
+                alert("Error updating notification.");
+            }
+        } catch (e) { alert("Network Error"); }
+        finally { btn.disabled = false; btn.innerText = 'Save Changes'; }
+    });
+}
+
+// --- PAGINATED USER NOTIFICATIONS LOGIC ---
+let userNotifications = [];
+let userNotifOffset = 0;
+
+async function fetchUserNotifications(loadMore = false) {
+    const list = document.getElementById('userNotificationList');
+    if(!list) return;
+    
+    if (loadMore) {
+        userNotifOffset += NOTIF_LIMIT;
+        const btn = document.getElementById('btnLoadMoreUser');
+        if(btn) btn.innerText = 'Loading...';
+    } else {
+        userNotifOffset = 0;
+        userNotifications = [];
+    }
+    
+    try {
+        const res = await fetch(`/api/user/notifications?limit=${NOTIF_LIMIT}&offset=${userNotifOffset}`, { credentials: 'same-origin' });
+        if (!res.ok) return;
+        const json = await res.json();
+        
+        if(json.success) {
+            const fetched = json.data;
+            
+            if (!loadMore) userNotifications = fetched;
+            else userNotifications = [...userNotifications, ...fetched];
+            
+            if(userNotifications.length === 0) {
+                list.innerHTML = '<div class="text-center text-muted mt-3" style="font-size:12px;">No notifications yet.</div>';
+                return;
+            }
+            
+            // User List puts newest at the top
+            let html = userNotifications.map(n => {
+                const dateObj = n.scheduled_for ? new Date(n.scheduled_for) : new Date(n.created_at);
+                const dateStr = dateObj.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' }) + ' ' + dateObj.toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+                
+                return `
+                <div class="chat-bubble sent" style="max-width: 100%; margin-left:0; border-radius: 8px;">
+                    <div class="chat-title">${n.title}</div>
+                    <div class="chat-body">${n.body}</div>
+                    ${n.url && n.url !== '/' ? `<a href="${n.url}" target="_blank" class="chat-link">${n.url}</a>` : ''}
+                    <div class="chat-meta mt-1 pt-1">
+                        <span>${dateStr}</span>
+                    </div>
+                </div>`;
+            }).join('');
+            
+            // "Show More" goes at the BOTTOM of the user notification panel
+            if (fetched.length === NOTIF_LIMIT) {
+                html += `<div class="text-center my-3"><button id="btnLoadMoreUser" class="btn btn-sm btn-outline-secondary w-100 fw-bold" style="font-size: 12px; border-radius: 8px; background: #fff;" onclick="fetchUserNotifications(true)">Show More History</button></div>`;
+            }
+
+            list.innerHTML = html;
+        }
+    } catch (e) {
+        if(!loadMore) list.innerHTML = '<div class="text-center text-danger mt-3" style="font-size:12px;">Error loading alerts.</div>';
+    }
+}

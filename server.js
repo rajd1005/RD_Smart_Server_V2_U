@@ -11,15 +11,39 @@ const fs = require('fs');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
 const mysql = require('mysql2/promise');
+const cron = require('node-cron');
 
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 ffmpeg.setFfmpegPath(ffmpegPath); 
 
+// --- ADVANCED FEATURE IMPORTS ---
+const { createClient } = require('redis');
+const { Queue, Worker } = require('bullmq');
+const webpush = require('web-push');
+// ------------------------------------
+
 const { pool, initDb } = require('./database');
 const authPool = require('./authDb'); 
 require('dotenv').config();
 
+// --- REDIS SETUP ---
+const redisClient = createClient({ 
+    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379' 
+});
+redisClient.on('error', (err) => console.log('Redis Client Error', err.message));
+redisClient.connect().then(() => console.log('✅ Connected to Redis')).catch(console.error);
+
+// --- BULLMQ QUEUE SETUP ---
+const redisConnection = { 
+    host: process.env.REDISHOST || process.env.REDIS_HOST || '127.0.0.1', 
+    port: parseInt(process.env.REDISPORT || process.env.REDIS_PORT || '6379'),
+    password: process.env.REDISPASSWORD || process.env.REDIS_PASSWORD || undefined
+};
+const videoQueue = new Queue('video-encoding', { connection: redisConnection });
+const pushQueue = new Queue('push-notifications', { connection: redisConnection });
+
+// === INITIALIZE EXPRESS APP FIRST ===
 const app = express();
 
 app.set('trust proxy', true); 
@@ -39,8 +63,16 @@ const upload = multer({ dest: 'uploads/' });
 
 const DELETE_PASSWORD = (process.env.DELETE_PASSWORD || "admin123").trim(); 
 const JWT_SECRET = (process.env.JWT_SECRET || "super_secret_key_123").trim();
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "admin@rdalgo.in").trim();
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "admin@rdalgo.in").trim().toLowerCase();
 const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "admin123").trim();
+const DEMO_USERS = [
+    { email: (process.env.DEMO_EMAIL || "demo@rdalgo.in").trim().toLowerCase(), password: (process.env.DEMO_PASSWORD || "demo123").trim() },
+    { email: "demo2@rdalgo.in", password: "demo123" },
+    { email: "demo3@rdalgo.in", password: "demo123" },
+    { email: "demo4@rdalgo.in", password: "demo123" },
+    { email: "demo5@rdalgo.in", password: "demo123" },
+    { email: "demo6@rdalgo.in", password: "demo123" }
+];
 
 const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
@@ -64,8 +96,6 @@ function getClientIp(req) {
     if (typeof ip === 'string' && ip.includes(',')) ip = ip.split(',')[0]; 
     return ip.trim().replace('::ffff:', '');
 }
-
-const debugLog = (msg) => console.log(`[AUTH DEBUG] ${msg}`);
 
 const authenticateToken = async (req, res, next) => {
     const token = req.cookies.authToken;
@@ -122,6 +152,7 @@ app.use(async (req, res, next) => {
 });
 
 app.use(express.static(path.join(__dirname, 'public'))); 
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", credentials: true } });
@@ -133,6 +164,184 @@ function getDBTime() { return new Date().toISOString(); }
 function calculatePoints(type, entry, currentPrice) { if (!entry || !currentPrice) return 0; return (type === 'BUY') ? (currentPrice - entry) : (entry - currentPrice); }
 function toMarkdown(text) { if (text === undefined || text === null) return ""; return String(text).replace(/_/g, "\\_").replace(/\*/g, "\\*").replace(/\[/g, "\\[").replace(/`/g, "\\`"); }
 
+// ========================================================
+// PUSH TARGETING & EXPIRATION SYNC LOGIC (IMMUNIZED)
+// ========================================================
+async function getValidPushSubscribers(audienceType) {
+    let query = "SELECT id, email, sub_data FROM push_subscriptions";
+    
+    // Public non-login targeting
+    if (audienceType === 'non_logged_in') {
+        query += " WHERE email = 'public'";
+    } 
+    // Any kind of logged-in user targeting
+    else if (audienceType !== 'both') {
+        query += " WHERE email != 'public'";
+    }
+    
+    const subs = await pool.query(query);
+    
+    // Quick exit for purely public notifications
+    if (audienceType === 'non_logged_in') {
+        const unique = [];
+        const eps = new Set();
+        for (let r of subs.rows) {
+            if (!eps.has(r.sub_data.endpoint)) { eps.add(r.sub_data.endpoint); unique.push(r.sub_data); }
+        }
+        return unique;
+    }
+
+    const emailsToCheck = [...new Set(subs.rows.filter(r => r.email !== 'public').map(r => String(r.email).toLowerCase().trim()))];
+    const actuallyValidEmails = new Set([ADMIN_EMAIL, ...DEMO_USERS.map(u => u.email), 'public']);
+    const expiredEmails = new Set();
+    const userLevels = new Map(); // Store level access per email
+
+    // Admin and Demo users default to having all levels
+    userLevels.set(ADMIN_EMAIL, { level_2_status: 'Yes', level_3_status: 'Yes', level_4_status: 'Yes' });
+    DEMO_USERS.forEach(u => userLevels.set(u.email, { level_2_status: 'Yes', level_3_status: 'Yes', level_4_status: 'Yes' }));
+
+    if (emailsToCheck.length > 0) {
+        const placeholders = emailsToCheck.map(() => '?').join(',');
+        try {
+            // Updated Query to also pull level statuses
+            const [wpRows] = await authPool.query(`SELECT student_email, student_expiry_date, level_2_status, level_3_status, level_4_status FROM wp_gf_student_registrations WHERE student_email IN (${placeholders})`, emailsToCheck);
+            
+            const d = new Date();
+            const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
+            const nowIST = new Date(utc + (3600000 * 5.5));
+
+            wpRows.forEach(row => {
+                const expiry = new Date(row.student_expiry_date);
+                if (isNaN(expiry.getTime()) || expiry >= nowIST) {
+                    if (row.student_email) {
+                        const email = String(row.student_email).toLowerCase().trim();
+                        actuallyValidEmails.add(email);
+                        // Save their level statuses
+                        userLevels.set(email, {
+                            level_2_status: row.level_2_status || 'No',
+                            level_3_status: row.level_3_status || 'No',
+                            level_4_status: row.level_4_status || 'No'
+                        });
+                    }
+                }
+            });
+
+            emailsToCheck.forEach(email => {
+                if (!actuallyValidEmails.has(email)) expiredEmails.add(email);
+            });
+        } catch(e) {
+            console.error("Auth DB Error during push sync (Failsafe activated)", e.message);
+            emailsToCheck.forEach(email => actuallyValidEmails.add(email)); 
+        }
+    }
+
+    // Downgrade expired subscriptions to public
+    if (expiredEmails.size > 0) {
+        const expiredArray = Array.from(expiredEmails);
+        await pool.query("UPDATE push_subscriptions SET email = 'public' WHERE LOWER(email) = ANY($1)", [expiredArray]).catch(()=>{});
+        console.log(`📉 Push Subs Downgraded to Public (Expired): ${expiredArray.length} users`);
+    }
+
+    const uniqueSubs = [];
+    const endpoints = new Set();
+
+    for (let row of subs.rows) {
+        let rowEmail = String(row.email).toLowerCase().trim();
+        let isValidAudience = false;
+        
+        if (audienceType === 'both') {
+            if (rowEmail === 'public' || actuallyValidEmails.has(rowEmail)) isValidAudience = true;
+        } else if (audienceType === 'logged_in') {
+            if (rowEmail !== 'public' && actuallyValidEmails.has(rowEmail)) isValidAudience = true;
+        } else {
+            // Handle the new specific level-based rules
+            if (rowEmail !== 'public' && actuallyValidEmails.has(rowEmail)) {
+                const levels = userLevels.get(rowEmail) || { level_2_status: 'No', level_3_status: 'No', level_4_status: 'No' };
+                
+                if (audienceType === 'login_no_level_2' && levels.level_2_status !== 'Yes') isValidAudience = true;
+                else if (audienceType === 'login_no_level_3' && levels.level_3_status !== 'Yes') isValidAudience = true;
+                else if (audienceType === 'login_no_level_4' && levels.level_4_status !== 'Yes') isValidAudience = true;
+                else if (audienceType === 'login_with_level_2' && levels.level_2_status === 'Yes') isValidAudience = true;
+                else if (audienceType === 'login_with_level_3' && levels.level_3_status === 'Yes') isValidAudience = true;
+                else if (audienceType === 'login_with_level_4' && levels.level_4_status === 'Yes') isValidAudience = true;
+            }
+        }
+
+        if (isValidAudience && !endpoints.has(row.sub_data.endpoint)) {
+            endpoints.add(row.sub_data.endpoint);
+            uniqueSubs.push(row.sub_data);
+        }
+    }
+
+    return uniqueSubs;
+}
+
+// System-Generated Automated Trade Pushes
+async function sendPushNotification(payload) {
+    try {
+        console.log(`\n🔔 --- PREPARING TRADE PUSH ---`);
+        console.log(`📝 Title: ${payload.title}`);
+        
+        const uniqueSubs = await getValidPushSubscribers('logged_in');
+        console.log(`🚀 Final Targeted Audience: ${uniqueSubs.length} Active Logged-in Devices`);
+        
+        for (let sub of uniqueSubs) {
+            await webpush.sendNotification(sub, JSON.stringify(payload)).catch(e => {
+                if (e.statusCode === 410) { pool.query("DELETE FROM push_subscriptions WHERE sub_data->>'endpoint' = $1", [sub.endpoint]).catch(()=>{}); }
+            });
+        }
+
+        await pool.query(
+            "INSERT INTO scheduled_notifications (title, body, url, status, target_audience, recurrence) VALUES ($1, $2, $3, 'sent', 'logged_in', 'none')",
+            [payload.title, payload.body, payload.url || '/']
+        );
+        io.emit('new_notification');
+        console.log(`✅ Trade Push Successfully Saved to Dashboard History!\n`);
+    } catch (err) { console.error("❌ Error sending trade push:", err); }
+}
+
+async function checkTradePushEnabled() {
+    try {
+        const res = await pool.query("SELECT setting_value FROM system_settings WHERE setting_key = 'push_trade_alerts'");
+        if (res.rows.length > 0) {
+            const val = res.rows[0].setting_value;
+            if (val === 'false' || val === false || val === '0') return false;
+        }
+        return true;
+    } catch(e) { return true; }
+}
+
+app.get('/api/push/public_key', (req, res) => {
+    if (app.locals.vapidPublicKey) {
+        res.json({ success: true, publicKey: app.locals.vapidPublicKey });
+    } else {
+        res.status(500).json({ success: false, msg: "VAPID key not initialized." });
+    }
+});
+
+app.post('/api/push/subscribe', async (req, res) => {
+    const subscription = req.body;
+    const endpoint = subscription.endpoint;
+    let email = 'public'; 
+
+    const token = req.cookies.authToken;
+    if (token) {
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            email = String(decoded.email).toLowerCase().trim();
+        } catch(e) {}
+    }
+
+    try {
+        const existing = await pool.query("SELECT id FROM push_subscriptions WHERE sub_data->>'endpoint' = $1", [endpoint]);
+        if (existing.rows.length === 0) {
+            await pool.query("INSERT INTO push_subscriptions (email, sub_data) VALUES ($1, $2)", [email, subscription]);
+        } else {
+            await pool.query("UPDATE push_subscriptions SET email = $1, sub_data = $2 WHERE id = $3", [email, subscription, existing.rows[0].id]);
+        }
+        res.status(201).json({ success: true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/public/call-report', async (req, res) => {
     const { start, end } = req.query;
@@ -151,7 +360,6 @@ app.get('/api/public/call-report', async (req, res) => {
     }
 });
 
-
 app.get('/api/public/gallery', async (req, res) => {
     try {
         const settingRes = await pool.query("SELECT setting_value FROM system_settings WHERE setting_key = 'show_gallery'");
@@ -165,31 +373,69 @@ app.get('/api/public/gallery', async (req, res) => {
 
 app.get('/api/settings', async (req, res) => {
     try {
+        const cachedSettings = await redisClient.get('system_settings').catch(()=>null);
+        if (cachedSettings) return res.json(JSON.parse(cachedSettings));
+
         const result = await pool.query("SELECT * FROM system_settings");
         const settings = {};
         result.rows.forEach(r => settings[r.setting_key] = r.setting_value);
+
+        await redisClient.setEx('system_settings', 3600, JSON.stringify(settings)).catch(()=>{}); 
         res.json(settings);
     } catch (err) { res.status(500).json({ error: "Server Error" }); }
 });
 
 app.put('/api/admin/settings', authenticateToken, isAdmin, async (req, res) => {
-    const { accordion_state, hide_trade_tab, show_gallery, show_call_widget, homepage_layout } = req.body;
+    const { 
+        accordion_state, hide_trade_tab, show_gallery, show_call_widget, homepage_layout,
+        show_sticky_footer, sticky_btn1_text, sticky_btn1_link, sticky_btn1_icon,
+        sticky_btn2_text, sticky_btn2_link, sticky_btn2_icon,
+        show_disclaimer, register_link, push_trade_alerts
+    } = req.body;
     try {
         await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('accordion_state', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [accordion_state || 'first']);
         await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('hide_trade_tab', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [hide_trade_tab || 'false']);
         await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('show_gallery', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [show_gallery || 'true']);
         await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('show_call_widget', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [show_call_widget || 'true']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('push_trade_alerts', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [push_trade_alerts || 'true']);
         
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('show_sticky_footer', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [show_sticky_footer || 'false']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('sticky_btn1_text', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [sticky_btn1_text || '']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('sticky_btn1_link', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [sticky_btn1_link || '']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('sticky_btn1_icon', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [sticky_btn1_icon || 'chat']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('sticky_btn2_text', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [sticky_btn2_text || '']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('sticky_btn2_link', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [sticky_btn2_link || '']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('sticky_btn2_icon', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [sticky_btn2_icon || 'send']);
+        
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('show_disclaimer', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [show_disclaimer || 'true']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('register_link', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [register_link || '']);
+
         if (homepage_layout) {
             await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('homepage_layout', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [homepage_layout]);
         }
         
+        await redisClient.del('system_settings').catch(()=>{});
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
+});
+
+app.put('/api/admin/settings/symbols', authenticateToken, isAdmin, async (req, res) => {
+    const { cat_forex_crypto, cat_stock, cat_index, cat_mcx } = req.body;
+    try {
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('cat_forex_crypto', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [cat_forex_crypto || '']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('cat_stock', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [cat_stock || '']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('cat_index', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [cat_index || '']);
+        await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('cat_mcx', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [cat_mcx || '']);
+        await redisClient.del('system_settings').catch(()=>{});
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
 
 app.get('/api/public/courses', async (req, res) => {
     try {
+        const cachedCourses = await redisClient.get('public_courses').catch(()=>null);
+        if (cachedCourses) return res.json(JSON.parse(cachedCourses));
+
         const modulesResult = await pool.query("SELECT id, title, description, required_level, display_order, lock_notice, show_on_home, dashboard_visibility FROM learning_modules ORDER BY display_order ASC");
         const lessonsResult = await pool.query("SELECT id, module_id, title, description, display_order, thumbnail_url, hls_manifest_url FROM lesson_videos ORDER BY display_order ASC");
         
@@ -208,6 +454,8 @@ app.get('/api/public/courses', async (req, res) => {
             });
             return { ...mod, lessons: safeLessons }; 
         });
+
+        await redisClient.setEx('public_courses', 600, JSON.stringify(coursesStructure)).catch(()=>{}); 
         res.json(coursesStructure);
     } catch (err) { res.status(500).json({ error: "Server Error fetching public courses." }); }
 });
@@ -224,7 +472,7 @@ app.get('/api/public/lesson/:id', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
     const { password, rememberMe } = req.body;
-    const email = req.body.email.trim();
+    const email = req.body.email.trim().toLowerCase();
     const clientIp = getClientIp(req);
     
     try {
@@ -232,9 +480,18 @@ app.post('/api/login', async (req, res) => {
         let accessLevels = { level_1_status: 'No', level_2_status: 'No', level_3_status: 'No', level_4_status: 'No' };
         let studentRecord = null;
 
+        const matchedDemo = DEMO_USERS.find(user => user.email === email && user.password === password);
+
         if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
             userEmail = ADMIN_EMAIL; userRole = "admin"; userPhone = "Admin";
             accessLevels = { level_1_status: 'Yes', level_2_status: 'Yes', level_3_status: 'Yes', level_4_status: 'Yes' };
+            
+        } else if (matchedDemo) {
+            userEmail = matchedDemo.email; 
+            userRole = "student"; 
+            userPhone = "Demo Account";
+            accessLevels = { level_1_status: 'Yes', level_2_status: 'Yes', level_3_status: 'Yes', level_4_status: 'Yes' };
+            
         } else {
             const localCreds = await pool.query("SELECT * FROM user_credentials WHERE email = $1", [email]);
             if (localCreds.rows.length > 0) {
@@ -250,9 +507,15 @@ app.post('/api/login', async (req, res) => {
                 const setupToken = jwt.sign({ email: rows[0].student_email, phone: rows[0].student_phone }, JWT_SECRET, { expiresIn: '15m' });
                 return res.json({ success: true, requires_setup: true, setupToken: setupToken, msg: "First login detected. Please create a secure password." });
             }
+            
             const expiryDate = new Date(studentRecord.student_expiry_date);
-            if (expiryDate < new Date()) { return res.status(403).json({ success: false, msg: "Account Expired. Please contact admin." }); }
-            userEmail = studentRecord.student_email; userPhone = studentRecord.student_phone; 
+            const getISTDate = () => { const d = new Date(); const utc = d.getTime() + (d.getTimezoneOffset() * 60000); return new Date(utc + (3600000 * 5.5)); };
+            if (!isNaN(expiryDate.getTime()) && expiryDate < getISTDate()) { 
+                return res.status(403).json({ success: false, msg: "Account Expired. Please contact admin." }); 
+            }
+            
+            userEmail = String(studentRecord.student_email).toLowerCase().trim();
+            userPhone = studentRecord.student_phone; 
             accessLevels = { level_1_status: 'Yes', level_2_status: studentRecord.level_2_status || 'No', level_3_status: studentRecord.level_3_status || 'No', level_4_status: studentRecord.level_4_status || 'No' };
         }
 
@@ -263,7 +526,9 @@ app.post('/api/login', async (req, res) => {
         const token = jwt.sign({ email: userEmail, phone: userPhone, sessionId: sessionId, role: userRole, accessLevels: accessLevels }, JWT_SECRET, { expiresIn: rememberMe ? '30d' : '1d' });
         const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
         res.cookie('authToken', token, { httpOnly: true, secure: isSecure, sameSite: 'lax', path: '/', maxAge: rememberMe ? 30 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000 });
-        res.json({ success: true, msg: "Login successful", email: userEmail, phone: userPhone, role: userRole, accessLevels: accessLevels });
+        
+        io.emit('force_logout', { email: userEmail, newSessionId: sessionId });
+        res.json({ success: true, msg: "Login successful", email: userEmail, phone: userPhone, role: userRole, accessLevels: accessLevels, sessionId: sessionId });
     } catch (error) { res.status(500).json({ success: false, msg: "Database connection error" }); }
 });
 
@@ -273,15 +538,16 @@ app.post('/api/set_password', async (req, res) => {
         const decoded = jwt.verify(setupToken, JWT_SECRET);
         const salt = crypto.randomBytes(16).toString('hex');
         const hash = crypto.pbkdf2Sync(newPassword, salt, 1000, 64, 'sha512').toString('hex');
-        await pool.query("INSERT INTO user_credentials (email, salt, hash) VALUES ($1, $2, $3) ON CONFLICT (email) DO UPDATE SET salt = EXCLUDED.salt, hash = EXCLUDED.hash", [decoded.email, salt, hash]);
+        await pool.query("INSERT INTO user_credentials (email, salt, hash) VALUES ($1, $2, $3) ON CONFLICT (email) DO UPDATE SET salt = EXCLUDED.salt, hash = EXCLUDED.hash", [String(decoded.email).toLowerCase(), salt, hash]);
         res.json({ success: true, email: decoded.email }); 
     } catch (err) { res.status(401).json({ success: false, msg: "Setup session expired. Please log in again." }); }
 });
 
 app.post('/api/forgot_password', async (req, res) => {
-    const { email } = req.body;
+    const email = req.body.email.trim().toLowerCase();
     try {
-        if (email === ADMIN_EMAIL) return res.status(400).json({ success: false, msg: "Admin password cannot be reset here." });
+        const isDemoEmail = DEMO_USERS.some(user => user.email === email);
+        if (email === ADMIN_EMAIL || isDemoEmail) return res.status(400).json({ success: false, msg: "This account password cannot be reset here." });
         const [rows] = await authPool.query("SELECT student_email FROM wp_gf_student_registrations WHERE student_email = ?", [email]);
         if (rows.length === 0) return res.status(404).json({ success: false, msg: "Email not found in registry." });
 
@@ -304,7 +570,8 @@ app.post('/api/forgot_password', async (req, res) => {
 });
 
 app.post('/api/reset_password', async (req, res) => {
-    const { email, otp, newPassword } = req.body;
+    const { otp, newPassword } = req.body;
+    const email = req.body.email.trim().toLowerCase();
     try {
         const result = await pool.query("SELECT * FROM password_resets WHERE email = $1 AND otp = $2 AND expires_at > NOW()", [email, otp]);
         if (result.rows.length === 0) return res.status(400).json({ success: false, msg: "Invalid or expired OTP." });
@@ -366,13 +633,10 @@ app.post('/api/accept_terms', authenticateToken, async (req, res) => {
             `
         };
         
-        // Await the email send to catch errors properly
         await transporter.sendMail(mailOptions);
-        
         res.json({ success: true });
     } catch (err) { 
         console.error("Mail Error:", err);
-        // Continue and log them in successfully even if SMTP fails so it doesn't break the app
         res.json({ success: true, msg: "Agreement recorded locally, but email failed to send." }); 
     }
 });
@@ -430,6 +694,29 @@ app.get('/api/lesson/:id', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: "Server Error fetching stream." }); }
 });
 
+app.post('/api/video/progress', authenticateToken, async (req, res) => {
+    const { lessonId, currentTime } = req.body;
+    try {
+        await pool.query(
+            "INSERT INTO video_progress (email, lesson_id, watched_seconds, last_watched) VALUES ($1, $2, $3, NOW()) ON CONFLICT (email, lesson_id) DO UPDATE SET watched_seconds = GREATEST(video_progress.watched_seconds, EXCLUDED.watched_seconds), last_watched = NOW()",
+            [req.user.email, lessonId, Math.floor(currentTime)]
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/video/progress', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT vp.email, vp.watched_seconds, vp.last_watched, lv.title 
+            FROM video_progress vp 
+            JOIN lesson_videos lv ON vp.lesson_id = lv.id 
+            ORDER BY vp.last_watched DESC LIMIT 100
+        `);
+        res.json(result.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/admin/modules', authenticateToken, isAdmin, async (req, res) => {
     const { title, description, required_level, display_order, lock_notice, show_on_home, dashboard_visibility } = req.body;
     try {
@@ -437,6 +724,7 @@ app.post('/api/admin/modules', authenticateToken, isAdmin, async (req, res) => {
             "INSERT INTO learning_modules (title, description, required_level, display_order, lock_notice, show_on_home, dashboard_visibility) VALUES ($1, $2, $3, $4, $5, $6, $7)", 
             [title, description, required_level, display_order || 0, lock_notice || '', show_on_home, dashboard_visibility || 'all']
         );
+        await redisClient.del('public_courses').catch(()=>{});
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
@@ -448,21 +736,28 @@ app.put('/api/admin/modules/:id', authenticateToken, isAdmin, async (req, res) =
             "UPDATE learning_modules SET title = $1, description = $2, required_level = $3, lock_notice = $4, display_order = $5, show_on_home = $6, dashboard_visibility = $7 WHERE id = $8", 
             [title, description, required_level, lock_notice || '', display_order || 0, show_on_home, dashboard_visibility || 'all', req.params.id]
         );
+        await redisClient.del('public_courses').catch(()=>{});
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
 
 app.delete('/api/admin/modules/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { password } = req.body;
+    if (password !== DELETE_PASSWORD) { return res.status(401).json({ success: false, msg: "❌ Incorrect Password!" }); }
+    
     try { 
         const videos = await pool.query("SELECT hls_manifest_url FROM lesson_videos WHERE module_id = $1", [req.params.id]);
         videos.rows.forEach(row => {
-            const parts = row.hls_manifest_url.split('/');
-            if (parts.length >= 3) {
-                const folderPath = path.join(hlsDir, parts[2]);
-                if (fs.existsSync(folderPath)) { fs.rmSync(folderPath, { recursive: true, force: true }); }
+            if (row.hls_manifest_url && row.hls_manifest_url !== 'PROCESSING') {
+                const parts = row.hls_manifest_url.split('/');
+                if (parts.length >= 3) {
+                    const folderPath = path.join(hlsDir, parts[2]);
+                    if (fs.existsSync(folderPath)) { fs.rmSync(folderPath, { recursive: true, force: true }); }
+                }
             }
         });
         await pool.query("DELETE FROM learning_modules WHERE id = $1", [req.params.id]); 
+        await redisClient.del('public_courses').catch(()=>{});
         res.json({ success: true }); 
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
@@ -475,6 +770,7 @@ app.post('/api/admin/modules/reorder', authenticateToken, isAdmin, async (req, r
                 await pool.query("UPDATE learning_modules SET display_order = $1 WHERE id = $2", [i, orderedIds[i]]);
             }
         }
+        await redisClient.del('public_courses').catch(()=>{});
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
@@ -488,6 +784,7 @@ app.post('/api/admin/lessons', authenticateToken, isAdmin, upload.fields([{ name
                 "INSERT INTO lesson_videos (module_id, title, description, hls_manifest_url, display_order, thumbnail_url) VALUES ($1, $2, $3, $4, $5, $6)", 
                 [module_id, title, description || '', '', display_order || 0, '']
             );
+            await redisClient.del('public_courses').catch(()=>{});
             return res.json({ success: true, msg: "Text Document Lesson Added Successfully." });
         } catch(e) {
             return res.status(500).json({ success: false, msg: e.message });
@@ -517,9 +814,34 @@ app.post('/api/admin/lessons', authenticateToken, isAdmin, upload.fields([{ name
         } catch (err) { console.error("Auto-thumbnail failed, skipping."); }
     }
 
+    try {
+        const dbResult = await pool.query(
+            "INSERT INTO lesson_videos (module_id, title, description, hls_manifest_url, display_order, thumbnail_url) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id", 
+            [module_id, title, description || '', 'PROCESSING', display_order || 0, thumbUrl]
+        );
+        const newLessonId = dbResult.rows[0].id;
+        await redisClient.del('public_courses').catch(()=>{});
+
+        // Queue for Background Worker
+        await videoQueue.add('encode', {
+            lessonDbId: newLessonId,
+            videoPath: videoFile.path,
+            hlsDirStr: hlsDir
+        });
+
+        res.json({ success: true, msg: "Video Uploaded. System is now converting it in the background. It will be available shortly." });
+    } catch (e) {
+        if (fs.existsSync(videoFile.path)) fs.unlinkSync(videoFile.path);
+        res.status(500).json({ success: false, msg: e.message });
+    }
+});
+
+// --- BULLMQ BACKGROUND WORKER DEFINITION ---
+const worker = new Worker('video-encoding', async job => {
+    const { lessonDbId, videoPath, hlsDirStr } = job.data;
     const lessonId = crypto.randomUUID();
-    const lessonHlsDir = path.join(hlsDir, lessonId);
-    fs.mkdirSync(lessonHlsDir, { recursive: true });
+    const lessonHlsDir = path.join(hlsDirStr, lessonId);
+    if (!fs.existsSync(lessonHlsDir)) fs.mkdirSync(lessonHlsDir, { recursive: true });
 
     const key = crypto.randomBytes(16);
     const keyPath = path.join(lessonHlsDir, 'enc.key');
@@ -531,30 +853,78 @@ app.post('/api/admin/lessons', authenticateToken, isAdmin, upload.fields([{ name
 
     const m3u8Path = `/hls/${lessonId}/output.m3u8`;
 
-    ffmpeg(videoFile.path)
-        .outputOptions([
-            '-profile:v baseline', 
-            '-level 3.0', 
-            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-            '-start_number 0', 
-            '-hls_time 10', 
-            '-hls_list_size 0', 
-            '-f hls', 
-            `-hls_key_info_file ${keyInfoPath}`
-        ])
-        .output(path.join(lessonHlsDir, 'output.m3u8'))
-        .on('end', async () => {
-            if (fs.existsSync(videoFile.path)) fs.unlinkSync(videoFile.path);
-            try { 
-                await pool.query("INSERT INTO lesson_videos (module_id, title, description, hls_manifest_url, display_order, thumbnail_url) VALUES ($1, $2, $3, $4, $5, $6)", 
-                [module_id, title, description || '', m3u8Path, display_order || 0, thumbUrl]); 
-            } catch(e) {}
-        })
-        .on('error', (err) => { if (fs.existsSync(videoFile.path)) fs.unlinkSync(videoFile.path); })
-        .run();
+    return new Promise((resolve, reject) => {
+        ffmpeg(videoPath)
+            .outputOptions([
+                '-profile:v baseline', 
+                '-level 3.0', 
+                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                '-start_number 0', 
+                '-hls_time 10', 
+                '-hls_list_size 0', 
+                '-f hls', 
+                `-hls_key_info_file ${keyInfoPath}`
+            ])
+            .output(path.join(lessonHlsDir, 'output.m3u8'))
+            .on('end', async () => {
+                if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+                await pool.query("UPDATE lesson_videos SET hls_manifest_url = $1 WHERE id = $2", [m3u8Path, lessonDbId]);
+                await redisClient.del('public_courses').catch(()=>{});
+                console.log(`✅ Background processing complete for Lesson ID: ${lessonDbId}`);
+                resolve();
+            })
+            .on('error', (err) => { 
+                if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath); 
+                reject(err); 
+            })
+            .run();
+    });
+}, { connection: redisConnection });
 
-    res.json({ success: true, msg: "Video Uploaded. System is now converting and encrypting it in the background." });
-});
+// --- DEDUPLICATED, TARGETED & RECURRING PUSH WORKER ---
+const pushWorker = new Worker('push-notifications', async job => {
+    const { notificationId } = job.data;
+    const { rows } = await pool.query("SELECT * FROM scheduled_notifications WHERE id = $1 AND status = 'pending'", [notificationId]);
+    
+    if (rows.length > 0) {
+        const notification = rows[0];
+        try {
+            const uniqueSubs = await getValidPushSubscribers(notification.target_audience || 'both');
+            const payload = { title: notification.title, body: notification.body, url: notification.url || '/', image: notification.image_path };
+
+            for (let sub of uniqueSubs) {
+                await webpush.sendNotification(sub, JSON.stringify(payload)).catch(e => {
+                    if (e.statusCode === 410) pool.query("DELETE FROM push_subscriptions WHERE sub_data->>'endpoint' = $1", [sub.endpoint]).catch(()=>{});
+                });
+            }
+            
+            if (notification.recurrence && notification.recurrence !== 'none') {
+                let nextTime = new Date(notification.scheduled_for || new Date());
+                if (notification.recurrence === 'daily') nextTime.setDate(nextTime.getDate() + 1);
+                else if (notification.recurrence === 'weekly') nextTime.setDate(nextTime.getDate() + 7);
+                
+                await pool.query("UPDATE scheduled_notifications SET scheduled_for = $1 WHERE id = $2", [nextTime, notificationId]);
+                
+                const delay = nextTime.getTime() - Date.now();
+                await pushQueue.add('send-push', { notificationId }, { delay: Math.max(delay, 0), jobId: `push_${notificationId}_${nextTime.getTime()}` });
+                console.log(`🔁 Notification ${notificationId} sent and rescheduled for ${nextTime}`);
+            } else {
+                await pool.query("UPDATE scheduled_notifications SET status = 'sent' WHERE id = $1", [notificationId]);
+                io.emit('new_notification');
+                console.log(`✅ Scheduled push notification sent: ${notification.title}`);
+
+                // --- DELETE SCHEDULED IMAGE AFTER ONE-TIME SEND ---
+                if (notification.image_path) {
+                    const filePath = path.join(__dirname, notification.image_path);
+                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                    await pool.query("UPDATE scheduled_notifications SET image_path = NULL WHERE id = $1", [notificationId]);
+                }
+            }
+        } catch (e) {
+            console.error("❌ Scheduled push failed:", e);
+        }
+    }
+}, { connection: redisConnection });
 
 app.put('/api/admin/lessons/:id', authenticateToken, isAdmin, upload.single('thumbnail_file'), async (req, res) => {
     const { title, description, display_order } = req.body;
@@ -570,14 +940,18 @@ app.put('/api/admin/lessons/:id', authenticateToken, isAdmin, upload.single('thu
         } else {
             await pool.query("UPDATE lesson_videos SET title = $1, description = $2, display_order = $3 WHERE id = $4", [title, description || '', display_order || 0, req.params.id]);
         }
+        await redisClient.del('public_courses').catch(()=>{});
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
 
 app.delete('/api/admin/lessons/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { password } = req.body;
+    if (password !== DELETE_PASSWORD) { return res.status(401).json({ success: false, msg: "❌ Incorrect Password!" }); }
+
     try { 
         const result = await pool.query("SELECT hls_manifest_url FROM lesson_videos WHERE id = $1", [req.params.id]);
-        if (result.rows.length > 0) {
+        if (result.rows.length > 0 && result.rows[0].hls_manifest_url && result.rows[0].hls_manifest_url !== 'PROCESSING') {
             const parts = result.rows[0].hls_manifest_url.split('/');
             if (parts.length >= 3) {
                 const folderPath = path.join(hlsDir, parts[2]);
@@ -585,6 +959,7 @@ app.delete('/api/admin/lessons/:id', authenticateToken, isAdmin, async (req, res
             }
         }
         await pool.query("DELETE FROM lesson_videos WHERE id = $1", [req.params.id]); 
+        await redisClient.del('public_courses').catch(()=>{});
         res.json({ success: true }); 
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
@@ -597,38 +972,284 @@ app.post('/api/admin/lessons/reorder', authenticateToken, isAdmin, async (req, r
                 await pool.query("UPDATE lesson_videos SET display_order = $1 WHERE id = $2", [i, orderedIds[i]]);
             }
         }
+        await redisClient.del('public_courses').catch(()=>{});
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
 });
 
+// ==========================================
+// PUSH NOTIFICATION ADMIN ROUTES 
+// ==========================================
+app.get('/api/admin/notifications', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 15;
+        const offset = parseInt(req.query.offset) || 0;
+        const result = await pool.query("SELECT * FROM scheduled_notifications ORDER BY COALESCE(scheduled_for, created_at) DESC LIMIT $1 OFFSET $2", [limit, offset]);
+        res.json({ success: true, data: result.rows });
+    } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
+});
+
+app.get('/api/admin/notifications/scheduled', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const result = await pool.query("SELECT * FROM scheduled_notifications WHERE status = 'pending' OR recurrence != 'none' ORDER BY created_at DESC");
+        res.json({ success: true, data: result.rows });
+    } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
+});
+
+app.get('/api/user/notifications', authenticateToken, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 15;
+        const offset = parseInt(req.query.offset) || 0;
+        
+        // 1. Base audiences everyone logged in can see
+        let allowedAudiences = ['both', 'logged_in'];
+        
+        // 2. Dynamically add audiences based on this specific user's levels
+        if (req.user && req.user.accessLevels) {
+            const levels = req.user.accessLevels;
+            
+            if (levels.level_2_status === 'Yes') allowedAudiences.push('login_with_level_2');
+            else allowedAudiences.push('login_no_level_2');
+            
+            if (levels.level_3_status === 'Yes') allowedAudiences.push('login_with_level_3');
+            else allowedAudiences.push('login_no_level_3');
+            
+            if (levels.level_4_status === 'Yes') allowedAudiences.push('login_with_level_4');
+            else allowedAudiences.push('login_no_level_4');
+        }
+
+        // 3. Query using ANY($1) array matching
+        const result = await pool.query(
+            "SELECT * FROM scheduled_notifications WHERE status = 'sent' AND target_audience = ANY($1) ORDER BY COALESCE(scheduled_for, created_at) DESC LIMIT $2 OFFSET $3", 
+            [allowedAudiences, limit, offset]
+        );
+        
+        res.json({ success: true, data: result.rows });
+    } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
+});
+
+app.post('/api/admin/notifications', authenticateToken, isAdmin, upload.single('push_image'), async (req, res) => {
+    const { title, body, url, schedule_time, target_audience, recurrence } = req.body;
+    let imagePath = req.file ? `/uploads/${req.file.filename}` : null;
+    let absoluteImagePath = req.file ? req.file.path : null;
+
+    try {
+        let parsedScheduleTime = null;
+        if (schedule_time) {
+            if (!schedule_time.includes('+') && !schedule_time.endsWith('Z')) {
+                const istString = schedule_time.length === 16 ? schedule_time + ":00+05:30" : schedule_time + "+05:30";
+                parsedScheduleTime = new Date(istString).toISOString(); 
+            } else {
+                parsedScheduleTime = new Date(schedule_time).toISOString();
+            }
+        }
+
+        const result = await pool.query(
+            "INSERT INTO scheduled_notifications (title, body, url, scheduled_for, status, target_audience, recurrence, image_path) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+            [title, body, url || '/', parsedScheduleTime || null, parsedScheduleTime ? 'pending' : 'sent', target_audience || 'both', recurrence || 'none', imagePath]
+        );
+        const notificationId = result.rows[0].id;
+
+        if (!parsedScheduleTime) {
+            const uniqueSubs = await getValidPushSubscribers(target_audience || 'both');
+            const payload = { title, body, url: url || '/', image: imagePath };
+            
+            uniqueSubs.forEach(sub => { 
+                webpush.sendNotification(sub, JSON.stringify(payload)).catch(e => {
+                    if(e.statusCode === 410) pool.query("DELETE FROM push_subscriptions WHERE sub_data->>'endpoint' = $1", [sub.endpoint]).catch(()=>{});
+                }); 
+            });
+            io.emit('new_notification');
+
+            // --- DELETE IMAGE IMMEDIATELY AFTER SENDING ---
+            if (absoluteImagePath && fs.existsSync(absoluteImagePath)) {
+                fs.unlinkSync(absoluteImagePath);
+                await pool.query("UPDATE scheduled_notifications SET image_path = NULL WHERE id = $1", [notificationId]);
+            }
+
+        } else {
+            const delay = new Date(parsedScheduleTime).getTime() - Date.now();
+            await pushQueue.add('send-push', { notificationId }, { delay: Math.max(delay, 0), jobId: `push_${notificationId}_${Date.now()}` });
+        }
+        res.json({ success: true, msg: "Notification saved!" });
+    } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
+});
+
+app.put('/api/admin/notifications/:id', authenticateToken, isAdmin, upload.single('push_image'), async (req, res) => {
+    const { title, body, url, schedule_time, target_audience, recurrence } = req.body;
+    let newImagePath = req.file ? `/uploads/${req.file.filename}` : null;
+
+    try {
+        let parsedScheduleTime = null;
+        if (schedule_time) {
+            if (!schedule_time.includes('+') && !schedule_time.endsWith('Z')) {
+                const istString = schedule_time.length === 16 ? schedule_time + ":00+05:30" : schedule_time + "+05:30";
+                parsedScheduleTime = new Date(istString).toISOString(); 
+            } else {
+                parsedScheduleTime = new Date(schedule_time).toISOString();
+            }
+        }
+
+        // --- NEW IMAGE REPLACEMENT LOGIC ---
+        if (newImagePath) {
+            // Delete old image if exists
+            const { rows } = await pool.query("SELECT image_path FROM scheduled_notifications WHERE id = $1", [req.params.id]);
+            if (rows.length > 0 && rows[0].image_path) {
+                const oldPath = path.join(__dirname, rows[0].image_path);
+                if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+            }
+
+            await pool.query(
+                "UPDATE scheduled_notifications SET title = $1, body = $2, url = $3, scheduled_for = $4, target_audience = $5, recurrence = $6, status = $7, image_path = $8 WHERE id = $9",
+                [title, body, url || '/', parsedScheduleTime || null, target_audience || 'both', recurrence || 'none', parsedScheduleTime ? 'pending' : 'sent', newImagePath, req.params.id]
+            );
+        } else {
+            // Just update text content without modifying image
+            await pool.query(
+                "UPDATE scheduled_notifications SET title = $1, body = $2, url = $3, scheduled_for = $4, target_audience = $5, recurrence = $6, status = $7 WHERE id = $8",
+                [title, body, url || '/', parsedScheduleTime || null, target_audience || 'both', recurrence || 'none', parsedScheduleTime ? 'pending' : 'sent', req.params.id]
+            );
+        }
+
+        const jobs = await pushQueue.getDelayed();
+        for (let job of jobs) {
+            if (job.data.notificationId === parseInt(req.params.id)) await job.remove();
+        }
+
+        if (parsedScheduleTime) {
+            const delay = new Date(parsedScheduleTime).getTime() - Date.now();
+            await pushQueue.add('send-push', { notificationId: parseInt(req.params.id) }, { delay: Math.max(delay, 0), jobId: `push_${req.params.id}_${Date.now()}` });
+        } else {
+            const uniqueSubs = await getValidPushSubscribers(target_audience || 'both');
+            
+            // Re-fetch to get image_path if it exists (for immediate send update)
+            const { rows } = await pool.query("SELECT image_path FROM scheduled_notifications WHERE id = $1", [req.params.id]);
+            const currentImagePath = rows.length > 0 ? rows[0].image_path : null;
+
+            const payload = { title, body, url: url || '/', image: currentImagePath };
+            uniqueSubs.forEach(sub => { webpush.sendNotification(sub, JSON.stringify(payload)).catch(e=>{}); });
+            io.emit('new_notification');
+            
+            // --- DELETE IMMEDIATE PUSH IMAGE FROM FS ---
+            if (currentImagePath) {
+                const filePath = path.join(__dirname, currentImagePath);
+                if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                await pool.query("UPDATE scheduled_notifications SET image_path = NULL WHERE id = $1", [req.params.id]);
+            }
+        }
+
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
+});
+
+app.delete('/api/admin/notifications/:id', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        // Find if there is an image associated with this notification and delete it
+        const { rows } = await pool.query("SELECT image_path FROM scheduled_notifications WHERE id = $1", [req.params.id]);
+        if (rows.length > 0 && rows[0].image_path) {
+            const filePath = path.join(__dirname, rows[0].image_path);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+
+        await pool.query("DELETE FROM scheduled_notifications WHERE id = $1", [req.params.id]);
+        
+        const jobs = await pushQueue.getDelayed();
+        for (let job of jobs) {
+            if (job.data.notificationId === parseInt(req.params.id)) await job.remove();
+        }
+
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ success: false, msg: err.message }); }
+});
+
+// ========================================================
+// TRADE ROUTES WITH NEW PUSH NOTIFICATION RULES
+// ========================================================
 app.get('/api/trades', authenticateToken, async (req, res) => {
     try { res.json((await pool.query(`SELECT * FROM trades WHERE CAST(created_at AS TIMESTAMP) >= NOW() - INTERVAL '30 days' ORDER BY id DESC`)).rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// --- NEW SIGNAL: PUSH REMOVED ENTIRELY TO STOP SPAM ---
 app.post('/api/signal_detected', async (req, res) => {
-    const { trade_id, symbol, type } = req.body;
+    const { trade_id, symbol, type, entry, sl, tp1, tp2, tp3 } = req.body;
     try {
-        const sentMsg = await bot.sendMessage(CHAT_ID, `🚨 *NEW SIGNAL DETECTED*\n\n💎 *Symbol:* #${toMarkdown(symbol)}\n📊 *Type:* ${toMarkdown(type)}\n🕒 *Time:* ${toMarkdown(getISTTime())}`, { parse_mode: 'Markdown' });
-        await pool.query(`INSERT INTO trades (trade_id, symbol, type, telegram_msg_id, created_at, status) VALUES ($1, $2, $3, $4, $5, 'SIGNAL') ON CONFLICT (trade_id) DO NOTHING;`, [trade_id, symbol, type, sentMsg.message_id, getDBTime()]);
+        console.log(`\n➡️ TRADE WEBHOOK RECEIVED: SIGNAL (${symbol} ${type})`);
+        
+        let sentMsgId = null;
+        try {
+            let tgMsg = `🚨 *NEW SIGNAL DETECTED*\n\n💎 *Symbol:* #${toMarkdown(symbol)}\n📊 *Type:* ${toMarkdown(type)}\n🕒 *Time:* ${toMarkdown(getISTTime())}`;
+            if (entry || sl || tp1) {
+                tgMsg += `\n\n🚪 *Entry:* ${toMarkdown(entry)}\n🛑 *SL:* ${toMarkdown(sl)}\n🎯 *TP1:* ${toMarkdown(tp1)} | *TP2:* ${toMarkdown(tp2)} | *TP3:* ${toMarkdown(tp3)}`;
+            }
+            const sentMsg = await bot.sendMessage(CHAT_ID, tgMsg, { parse_mode: 'Markdown' });
+            sentMsgId = sentMsg.message_id;
+        } catch (tgErr) { console.error("⚠️ Telegram Send Failed (Skipping TG):", tgErr.message); }
+
+        await pool.query(
+            `INSERT INTO trades (trade_id, symbol, type, entry_price, sl_price, tp1_price, tp2_price, tp3_price, telegram_msg_id, created_at, status) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'SIGNAL') ON CONFLICT (trade_id) DO NOTHING;`, 
+             [trade_id, symbol, type, entry || 0, sl || 0, tp1 || 0, tp2 || 0, tp3 || 0, sentMsgId, getDBTime()]
+        );
         await pool.query("DELETE FROM trades WHERE CAST(created_at AS TIMESTAMP) < NOW() - INTERVAL '30 days'");
-        io.emit('trade_update'); res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        
+        io.emit('trade_update'); 
+        
+        // Removed Push Notification trigger from here to reduce spam.
+
+        res.json({ success: true });
+    } catch (err) { 
+        console.error("❌ SIGNAL ENDPOINT ERROR:", err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
+// --- SETUP CONFIRMED: NOW SHOWS BUY/SELL AND FULL TARGETS ---
 app.post('/api/setup_confirmed', async (req, res) => {
     const { trade_id, symbol, type, entry, sl, tp1, tp2, tp3 } = req.body;
     try {
+        console.log(`\n➡️ TRADE WEBHOOK RECEIVED: SETUP CONFIRMED (${symbol})`);
+
+        const isPushEnabled = await checkTradePushEnabled();
         const oldTrades = await pool.query("SELECT * FROM trades WHERE symbol = $1 AND status IN ('SIGNAL', 'SETUP', 'ACTIVE') AND trade_id != $2", [symbol, trade_id]);
+        
+        let reversalSymbols = [];
         for (const t of oldTrades.rows) {
             await pool.query("UPDATE trades SET status = 'CLOSED (Reversal)' WHERE trade_id = $1", [t.trade_id]);
-            if(t.telegram_msg_id) { bot.sendMessage(CHAT_ID, `🔄 *Trade Reversed*\n❌ Closed by new signal.`, { reply_to_message_id: t.telegram_msg_id, parse_mode: 'Markdown' }); }
+            
+            try {
+                if(t.telegram_msg_id) { await bot.sendMessage(CHAT_ID, `🔄 *Trade Reversed*\n❌ Closed by new signal.`, { reply_to_message_id: t.telegram_msg_id, parse_mode: 'Markdown' }); }
+            } catch(tgErr) { console.error("⚠️ Telegram Reversal Send Failed (Skipping TG):", tgErr.message); }
+            
+            reversalSymbols.push(t.symbol);
         }
+        
         const check = await pool.query("SELECT telegram_msg_id FROM trades WHERE trade_id = $1", [trade_id]);
         await pool.query(`INSERT INTO trades (trade_id, symbol, type, entry_price, sl_price, tp1_price, tp2_price, tp3_price, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'SETUP', $9) ON CONFLICT (trade_id) DO UPDATE SET entry_price = EXCLUDED.entry_price, sl_price = EXCLUDED.sl_price, tp1_price = EXCLUDED.tp1_price, tp2_price = EXCLUDED.tp2_price, tp3_price = EXCLUDED.tp3_price, status = 'SETUP';`, [trade_id, symbol, type, entry, sl, tp1, tp2, tp3, getDBTime()]);
-        const opts = { parse_mode: 'Markdown' }; if (check.rows[0]?.telegram_msg_id) opts.reply_to_message_id = check.rows[0].telegram_msg_id;
-        await bot.sendMessage(CHAT_ID, `✅ *SETUP CONFIRMED*\n\n💎 *Symbol:* #${toMarkdown(symbol)}\n🚀 *Type:* ${toMarkdown(type)}\n🚪 *Entry:* ${toMarkdown(entry)}\n🛑 *SL:* ${toMarkdown(sl)}\n\n🎯 *TP1:* ${toMarkdown(tp1)}\n🎯 *TP2:* ${toMarkdown(tp2)}\n🎯 *TP3:* ${toMarkdown(tp3)}`, opts);
-        io.emit('trade_update'); res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        
+        try {
+            const opts = { parse_mode: 'Markdown' }; if (check.rows[0]?.telegram_msg_id) opts.reply_to_message_id = check.rows[0].telegram_msg_id;
+            await bot.sendMessage(CHAT_ID, `✅ *SETUP CONFIRMED*\n\n💎 *Symbol:* #${toMarkdown(symbol)}\n🚀 *Type:* ${toMarkdown(type)}\n🚪 *Entry:* ${toMarkdown(entry)}\n🛑 *SL:* ${toMarkdown(sl)}\n\n🎯 *TP1:* ${toMarkdown(tp1)}\n🎯 *TP2:* ${toMarkdown(tp2)}\n🎯 *TP3:* ${toMarkdown(tp3)}`, opts);
+        } catch(tgErr) { console.error("⚠️ Telegram Send Failed (Skipping TG):", tgErr.message); }
+
+        io.emit('trade_update'); 
+        
+        if (isPushEnabled) { 
+            let bodyStr = `${symbol} - ${type}\nEntry: ${entry} | SL: ${sl}\nTargets: ${tp1}, ${tp2}, ${tp3}`;
+            if (reversalSymbols.length > 0) {
+                bodyStr = `🔄 CLOSED: ${reversalSymbols.join(', ')} (Reversal)\n\n${bodyStr}`;
+            }
+            
+            await sendPushNotification({ 
+                title: '✅ SETUP CONFIRMED', 
+                body: bodyStr 
+            }); 
+        }
+        
+        res.json({ success: true });
+    } catch (err) { 
+        console.error("❌ SETUP ENDPOINT ERROR:", err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 app.post('/api/price_update', async (req, res) => {
@@ -643,18 +1264,40 @@ app.post('/api/price_update', async (req, res) => {
 app.post('/api/log_event', async (req, res) => {
     const { trade_id, new_status, price } = req.body;
     try {
+        console.log(`\n➡️ TRADE WEBHOOK RECEIVED: EVENT (${new_status})`);
+
         const result = await pool.query("SELECT * FROM trades WHERE trade_id = $1", [trade_id]);
         if (result.rows.length === 0) return res.json({ success: false, msg: "Trade not found" });
         const trade = result.rows[0];
+        
         if (trade.status.includes('TP') && new_status === 'SL HIT') { return res.json({ success: true, msg: "Profit Locked: SL Ignored" }); }
         if (trade.status === 'TP3 HIT' && (new_status === 'TP2 HIT' || new_status === 'TP1 HIT')) return res.json({ success: true });
         if (trade.status === 'TP2 HIT' && new_status === 'TP1 HIT') return res.json({ success: true });
         if (trade.status === new_status) return res.json({ success: true }); 
+
         await pool.query("UPDATE trades SET status = $1, points_gained = $2 WHERE trade_id = $3", [new_status, calculatePoints(trade.type, trade.entry_price, price), trade_id]);
-        const opts = { parse_mode: 'Markdown' }; if (trade.telegram_msg_id) opts.reply_to_message_id = trade.telegram_msg_id;
-        await bot.sendMessage(CHAT_ID, `⚡ *UPDATE: ${toMarkdown(new_status)}*\n\n💎 *Symbol:* #${toMarkdown(trade.symbol)}\n📉 *Price:* ${toMarkdown(price)}`, opts);
-        io.emit('trade_update'); res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        
+        try {
+            const opts = { parse_mode: 'Markdown' }; if (trade.telegram_msg_id) opts.reply_to_message_id = trade.telegram_msg_id;
+            await bot.sendMessage(CHAT_ID, `⚡ *UPDATE: ${toMarkdown(new_status)}*\n\n💎 *Symbol:* #${toMarkdown(trade.symbol)}\n📉 *Price:* ${toMarkdown(price)}`, opts);
+        } catch(tgErr) { console.error("⚠️ Telegram Send Failed (Skipping TG):", tgErr.message); }
+        
+        io.emit('trade_update'); 
+        
+        const isPushEnabled = await checkTradePushEnabled();
+        
+        // SL HIT Notifications are Muted
+        if (isPushEnabled && new_status !== 'SL HIT') { 
+            await sendPushNotification({ title: `⚡ ${new_status}`, body: `${trade.symbol} @ ${price}` }); 
+        } else if (new_status === 'SL HIT') {
+            console.log(`🔇 Skipping push notification for SL HIT as per rules.`);
+        }
+        
+        res.json({ success: true });
+    } catch (err) { 
+        console.error("❌ LOG EVENT ENDPOINT ERROR:", err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 app.post('/api/delete_trades', authenticateToken, async (req, res) => {
@@ -664,5 +1307,64 @@ app.post('/api/delete_trades', authenticateToken, async (req, res) => {
     try { await pool.query("DELETE FROM trades WHERE trade_id = ANY($1)", [trade_ids]); io.emit('trade_update'); res.json({ success: true }); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// =========================================================
+// DAILY AUTOMATED LOGOUT (6:30 AM) & NOTIFICATION CLEANUP
+// =========================================================
+cron.schedule('30 6 * * *', async () => {
+    try {
+        await pool.query("DELETE FROM login_logs");
+        // Ensure we only delete sent, NON-recurring notifications
+        await pool.query("DELETE FROM scheduled_notifications WHERE created_at < NOW() - INTERVAL '30 days' AND (recurrence = 'none' OR recurrence IS NULL) AND status = 'sent'");
+        console.log("✅ Daily Reset: All user sessions cleared and non-recurring notifications older than 30 days deleted at 6:30 AM.");
+    } catch (err) {
+        console.error("❌ Error clearing daily sessions/notifications:", err);
+    }
+}, {
+    scheduled: true,
+    timezone: "Asia/Kolkata"
+});
+
 const PORT = process.env.PORT || 3000;
-initDb().then(() => { server.listen(PORT, () => console.log(`🚀 RD Broker Server running on ${PORT}`)); });
+
+// === SERVER INITIALIZATION & AUTO-GENERATE VAPID KEYS ===
+initDb().then(async () => { 
+    
+    let vapidPublicKey = process.env.VAPID_PUBLIC_KEY;
+    let vapidPrivateKey = process.env.VAPID_PRIVATE_KEY;
+
+    try {
+        if (!vapidPublicKey || !vapidPrivateKey) {
+            const pubRes = await pool.query("SELECT setting_value FROM system_settings WHERE setting_key = 'vapid_public'");
+            const privRes = await pool.query("SELECT setting_value FROM system_settings WHERE setting_key = 'vapid_private'");
+            
+            if (pubRes.rows.length > 0 && privRes.rows.length > 0) {
+                vapidPublicKey = pubRes.rows[0].setting_value;
+                vapidPrivateKey = privRes.rows[0].setting_value;
+            } else {
+                console.log("⚠️ No VAPID keys found in env or DB. Generating new ones automatically...");
+                const vapidKeys = webpush.generateVAPIDKeys();
+                vapidPublicKey = vapidKeys.publicKey;
+                vapidPrivateKey = vapidKeys.privateKey;
+                
+                await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('vapid_public', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [vapidPublicKey]);
+                await pool.query("INSERT INTO system_settings (setting_key, setting_value) VALUES ('vapid_private', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [vapidPrivateKey]);
+                console.log("✅ New VAPID keys generated and saved to PostgreSQL.");
+            }
+        }
+
+        webpush.setVapidDetails(
+            'mailto:' + (process.env.ADMIN_EMAIL || 'admin@rdalgo.in'),
+            vapidPublicKey.trim(),
+            vapidPrivateKey.trim()
+        );
+        
+        // Save globally so the frontend API can fetch it
+        app.locals.vapidPublicKey = vapidPublicKey.trim();
+        console.log("✅ Web Push VAPID configured successfully.");
+
+    } catch (e) {
+        console.error("❌ Failed to setup VAPID keys:", e.message);
+    }
+
+    server.listen(PORT, () => console.log(`🚀 RD Broker Server running on ${PORT}`)); 
+});
