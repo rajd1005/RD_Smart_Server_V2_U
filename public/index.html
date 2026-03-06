@@ -12,6 +12,9 @@
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
     <link href="https://vjs.zencdn.net/8.10.0/video-js.css" rel="stylesheet" />
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#007aff">
+    <link rel="apple-touch-icon" href="/logo.png">
 
     <style>
         :root {
@@ -125,11 +128,18 @@
 
         <header class="app-header">
             <div class="d-flex align-items-center">
-                <div class="app-title">Rd Algo Dashboard</div>
+                <div class="app-title">Rd Algo</div>
                 <div id="activeDateDisplay" style="font-size: 10px; background: #e3f2fd; color: var(--blue); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 600;">Loading...</div>
             </div>
             <div class="d-flex align-items-center">
                 <div class="server-time" id="clock" style="margin-right: 15px;">00:00:00</div>
+                
+                <button id="installAppBtn" onclick="installPWA()" style="display:none; background:#00b346; color:#fff; border:none; border-radius:4px; padding:4px 8px; font-size:11px; font-weight:bold; margin-right: 15px;">
+        <span class="material-icons-round" style="font-size:14px; vertical-align:middle;">download</span> Install
+    </button>
+                <button id="btnAdminCourseManager" class="position-relative" type="button" data-bs-toggle="modal" data-bs-target="#adminCourseModal" style="display:none; background:none; border:none; color:var(--blue); padding:0; align-items:center; margin-right: 15px;">
+                    <span class="material-icons-round">settings</span>
+                </button>
                 
                 <button class="position-relative" type="button" data-bs-toggle="offcanvas" data-bs-target="#notificationSheet" style="background:none; border:none; color:var(--text-primary); padding:0; display:flex; align-items:center; margin-right: 15px;">
                     <span class="material-icons-round">notifications</span>
@@ -171,7 +181,6 @@
                     <button class="btn btn-sm btn-outline-secondary ms-1" onclick="toggleAccordions('none')" style="font-size: 11px;">Close All</button>
                     <button class="btn btn-sm btn-outline-primary ms-1" onclick="toggleAccordions('first')" style="font-size: 11px;">Open 1st</button>
                 </div>
-                <button id="btnAdminCourseManager" class="btn btn-sm btn-dark fw-bold ms-auto" style="display:none; font-size: 11px;" data-bs-toggle="modal" data-bs-target="#adminCourseModal">⚙️ Admin Manager</button>
             </div>
             
             <div class="accordion" id="courseModuleContainer">
@@ -501,10 +510,15 @@
                                     <input type="checkbox" class="custom-check m-0" id="adminShowDisclaimer">
                                     <label class="form-check-label ms-2 fw-bold" for="adminShowDisclaimer" style="font-size: 11px; color: var(--text-secondary); cursor: pointer;">Show Legal Disclaimer Popup</label>
                                 </div>
-                                <div class="mb-4">
-                                    <label class="form-label fw-bold mb-1" style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">Registration Link</label>
-                                    <input type="text" id="adminRegisterLink" class="form-control" placeholder="URL for New Registrations">
-                                </div>
+<div class="mb-4">
+    <label class="form-label fw-bold mb-1" style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">Registration Link</label>
+    <input type="text" id="adminRegisterLink" class="form-control" placeholder="URL for New Registrations">
+</div>
+
+<div class="mb-4">
+    <label class="form-label fw-bold mb-1" style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">Manager Emails (Comma-separated)</label>
+    <input type="text" id="adminManagerEmails" class="form-control" placeholder="manager1@example.com, manager2@example.com">
+</div>
                                 
                                 <div class="mb-4">
                                     <label class="form-label fw-bold mb-1" style="font-size: 9px; color: var(--text-secondary); text-transform: uppercase;">Homepage Layout Order (Drag to Reorder)</label>
@@ -728,7 +742,12 @@
     <script src="https://vjs.zencdn.net/8.10.0/video.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
     
-    <script src="app.js?v=4.0"></script>
+    <script src="/js/api.config.js"></script>
+    <script src="/js/auth.js"></script>
+    <script src="/js/trades.js"></script>
+    <script src="/js/courses.js"></script>
+    <script src="/js/admin.js"></script>
+    <script src="/js/notifications.js"></script>
     
     <script>
         setInterval(() => { document.getElementById('clock').innerText = new Date().toLocaleTimeString('en-GB'); }, 1000);
@@ -763,5 +782,47 @@
             }
         }
     </script>
+    <div class="modal fade" id="pushReminderModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered" style="max-width: 340px; margin: 0 auto;">
+        <div class="modal-content text-center p-3">
+            <div class="modal-header border-0 pb-0 justify-content-center">
+                <span class="material-icons-round text-primary" style="font-size: 48px;">notifications_active</span>
+            </div>
+            <div class="modal-body px-4 pb-2 pt-3">
+                <h5 class="fw-bold mb-2" id="pushModalTitle">Never Miss a Trade!</h5>
+                <p class="text-muted small mb-3" style="font-size: 13px; line-height: 1.4;" id="pushModalDesc">
+                    Get instant alerts for new signals, setups, and profit booking directly on your device.
+                </p>
+                
+                <div id="pushBlockedInstructions" style="display: none; background: #fff3cd; color: #856404; padding: 10px; border-radius: 8px; font-size: 11px; text-align: left; margin-bottom: 15px;">
+                    <strong>Notifications are blocked.</strong><br>
+                    1. Click the 🔒 padlock icon next to our URL at the top of your browser.<br>
+                    2. Change "Notifications" to <strong>Allow</strong>.<br>
+                    3. Refresh this page.
+                </div>
+
+                <button type="button" class="btn btn-primary w-100 fw-bold mb-2" id="btnEnablePush" onclick="handlePushEnableClick()">Enable Notifications</button>
+                <button type="button" class="btn btn-light w-100 fw-bold text-muted" data-bs-dismiss="modal" onclick="dismissPushPrompt()">Maybe Later</button>
+            </div>
+        </div>
+    </div>
+</div>
+    <div class="modal fade" id="installAppModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered" style="max-width: 340px; margin: 0 auto;">
+        <div class="modal-content text-center p-3">
+            <div class="modal-header border-0 pb-0 justify-content-center">
+                <span class="material-icons-round text-success" style="font-size: 48px;">download_for_offline</span>
+            </div>
+            <div class="modal-body px-4 pb-2 pt-3">
+                <h5 class="fw-bold mb-2">Install RD Algo App</h5>
+                <p class="text-muted small mb-3" style="font-size: 13px; line-height: 1.4;">
+                    Install our app on your device for a faster, full-screen trading experience and quick access.
+                </p>
+                <button type="button" class="btn btn-success w-100 fw-bold mb-2" id="btnEnableInstall" onclick="handleInstallAppClick()">Install App</button>
+                <button type="button" class="btn btn-light w-100 fw-bold text-muted" data-bs-dismiss="modal" onclick="dismissInstallPrompt()">Maybe Later</button>
+            </div>
+        </div>
+    </div>
+</div>
 </body>
 </html>
